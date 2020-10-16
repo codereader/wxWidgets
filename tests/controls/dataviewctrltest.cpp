@@ -20,6 +20,8 @@
 
 #include "wx/app.h"
 #include "wx/dataview.h"
+#include "wx/sizer.h"
+#include "wx/dialog.h"
 #ifdef __WXGTK__
     #include "wx/stopwatch.h"
 #endif // __WXGTK__
@@ -91,6 +93,22 @@ protected:
     wxDECLARE_NO_COPY_CLASS(MultiColumnsDataViewCtrlTestCase);
 };
 
+class DataViewCtrlWithModelTestCase
+{
+public:
+    DataViewCtrlWithModelTestCase();
+
+protected:
+    wxDialog* m_dialog;
+    // the dataview control itself
+    wxDataViewCtrl* m_dvc;
+
+    wxDataViewColumn* m_firstColumn;
+    wxDataViewColumn* m_lastColumn;
+
+    wxDECLARE_NO_COPY_CLASS(DataViewCtrlWithModelTestCase);
+};
+
 // ----------------------------------------------------------------------------
 // test initialization
 // ----------------------------------------------------------------------------
@@ -142,9 +160,180 @@ MultiColumnsDataViewCtrlTestCase::~MultiColumnsDataViewCtrlTestCase()
     delete m_dvc;
 }
 
+// Custom wxDataViewModel implementation
+class CustomTreeModel :
+    public wxDataViewModel
+{
+public:
+    struct Node
+    {
+        Node(Node* parent_, const wxString& value_) :
+            parent(parent_),
+            value(value_)
+        {}
+
+        ~Node()
+        {
+            for (auto* child : children)
+            {
+                delete child;
+            }
+        }
+
+        Node(const Node& other) = default;
+        Node& operator=(const Node& other) = default;
+
+        Node* AddChild(const wxString& childValue)
+        {
+            children.push_back(new Node(this, childValue));
+            return children.back();
+        }
+
+        Node* parent;
+        wxVariant value;
+        wxVector<Node*> children;
+    };
+
+private:
+    Node* m_root;
+public:
+    CustomTreeModel() :
+        m_root(new Node(nullptr, "Root"))
+    {}
+
+    Node* GetRoot()
+    {
+        return m_root;
+    }
+
+    void Populate()
+    {
+        // Build the test structure, just a few items
+        auto* a = m_root->AddChild("A");
+
+        auto* aa = a->AddChild("A-A");
+        auto* ab = a->AddChild("A-B");
+        auto* ac = a->AddChild("A-C");
+
+        aa->AddChild("A-A-1");
+        ab->AddChild("A-B-1");
+        ac->AddChild("A-C-2");
+    }
+
+    ~CustomTreeModel()
+    {
+        delete m_root;
+    }
+
+    unsigned int GetColumnCount() const override
+    {
+        return 1;
+    }
+
+    wxString GetColumnType(unsigned int WXUNUSED(col)) const override
+    {
+        return "string";
+    }
+
+    void GetValue(wxVariant& variant, const wxDataViewItem& item, unsigned int WXUNUSED(col)) const override
+    {
+        const Node* node = item.IsOk() ? static_cast<const Node*>(item.GetID()) : m_root;
+        variant = node->value;
+    }
+
+    bool SetValue(const wxVariant& variant, const wxDataViewItem& item, unsigned int WXUNUSED(col)) override
+    {
+        Node* node = item.IsOk() ? static_cast<Node*>(item.GetID()) : m_root;
+        node->value = variant;
+        return true;
+    }
+
+    wxDataViewItem GetParent(const wxDataViewItem& item) const override
+    {
+        if (!item.IsOk())
+        {
+            return wxDataViewItem(nullptr);
+        }
+
+        Node* node = static_cast<Node*>(item.GetID());
+
+        if (node->parent != nullptr && node->parent != m_root)
+        {
+            return wxDataViewItem(node->parent);
+        }
+
+        return wxDataViewItem(nullptr);
+    }
+
+    bool IsContainer(const wxDataViewItem& WXUNUSED(item)) const override
+    {
+        return true; // all nodes can be containers
+    }
+
+    unsigned int GetChildren(const wxDataViewItem& item, wxDataViewItemArray& children) const override
+    {
+        // Requests for invalid items are asking for root children, actually
+        const Node* node = !item.IsOk() ? m_root : static_cast<const Node*>(item.GetID());
+
+        for (auto* child : node->children)
+        {
+            children.Add(wxDataViewItem(child));
+        }
+
+        return static_cast<unsigned int>(node->children.size());
+    }
+};
+
+void SendItemAddedEventsForAllChildrenRecursively(CustomTreeModel& model, CustomTreeModel::Node* node)
+{
+    for (auto* child : node->children)
+    {
+        wxDataViewItem item(child);
+        model.ItemAdded(model.GetParent(item), item);
+
+        SendItemAddedEventsForAllChildrenRecursively(model, child);
+    }
+}
+
+DataViewCtrlWithModelTestCase::DataViewCtrlWithModelTestCase()
+{
+    m_dialog = new wxDialog(wxTheApp->GetTopWindow(), wxID_ANY, "DataViewCtrlWithModel");
+    m_dialog->SetSizer(new wxBoxSizer(wxHORIZONTAL));
+
+    m_dvc = new wxDataViewCtrl(m_dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize);
+    m_dialog->GetSizer()->Add(m_dvc, 1, wxEXPAND|wxALL, 6);
+
+    // Create the test data model
+    auto* model = new CustomTreeModel();
+
+    m_dvc->AssociateModel(model);
+    model->DecRef(); // pass ownership to dataviewctrl
+
+    m_firstColumn = m_dvc->AppendTextColumn(wxString(), 0, wxDATAVIEW_CELL_INERT, wxCOL_WIDTH_AUTOSIZE);
+}
+
 // ----------------------------------------------------------------------------
 // the tests themselves
 // ----------------------------------------------------------------------------
+
+TEST_CASE_METHOD(DataViewCtrlWithModelTestCase, "wxDataViewModel::ItemAdded")
+{
+    auto* model = static_cast<CustomTreeModel*>(m_dvc->GetModel());
+
+    // Pump some data into the model and send ItemAdded events
+    model->Populate();
+
+    // After sending the ItemAdded events, all the items
+    // below the first hierarchy level end up with duplicate representations
+    // in the tree.
+    SendItemAddedEventsForAllChildrenRecursively(*model, model->GetRoot());
+
+    // No assert here, since we don't have access to the underlying wxDataViewMainWindow
+    // where all the duplicated nodes are created and added to
+    m_dialog->Layout();
+    m_dialog->ShowModal();
+    m_dialog->Destroy();
+}
 
 TEST_CASE_METHOD(MultiSelectDataViewCtrlTestCase,
                  "wxDVC::Selection",
